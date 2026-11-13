@@ -144,7 +144,8 @@ Checks run on this release:
 
 `ink2.sh` starts and stops the server; `ink2/` holds the patches that `sitecustomize.py` installs into vLLM's Inkling 2
 model; `placement/` holds the expert placements and the routing counts they were built from; `tools/mkplace.py` builds
-a placement from routing counts; `bench/` holds the checks and benchmarks.
+a placement from routing counts; `bench/` holds the checks and benchmarks. The placement files are also on Hugging Face
+([chronarion/Inkling-2-Small-ink2](https://huggingface.co/chronarion/Inkling-2-Small-ink2)).
 
 <details><summary>Settings (environment variables)</summary>
 
