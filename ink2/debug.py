@@ -96,3 +96,34 @@ def check_route(layer, T, src, gam, tiles, plan, W):
     if bad:
         _LOG(f"band route layer {layer} T={T}: rows {rows} tile {tile} max_ctas {m} tiles size {t.numel()} gam size "
              f"{gam.numel()}; src {s.tolist()[:16]}; tiles {t.tolist()[:24]}" + (f"; BAD: {bad}" if bad else ""))
+
+
+# INK2_PROF_STEPS=start:stop (development): cudaProfilerStart / Stop around real steps [start, stop) of the model runner,
+# for nsys --capture-range=cudaProfilerApi (the boot, its warm-up and its CUDA graph captures then run without tracing)
+_PROF = os.environ.get("INK2_PROF_STEPS", "")
+
+
+def install_profiler_steps():
+    if not _PROF:
+        return
+    a, b = (int(v) for v in _PROF.split(":"))
+    from vllm.v1.worker.gpu import model_runner as mr
+    cls = mr.GPUModelRunner
+    orig = cls.execute_model
+    n = [0]
+
+    def execute_model(self, scheduler_output, *args, **kwargs):
+        real = scheduler_output.total_num_scheduled_tokens and not kwargs.get("dummy_run", False) and not any(
+            r.startswith("_") for r in scheduler_output.num_scheduled_tokens)
+        if real:
+            if n[0] == a:
+                torch.cuda.synchronize()
+                torch.cuda.cudart().cudaProfilerStart()
+                _LOG(f"profiler started at step {a}")
+            elif n[0] == b:
+                torch.cuda.synchronize()
+                torch.cuda.cudart().cudaProfilerStop()
+                _LOG(f"profiler stopped at step {b}")
+            n[0] += 1
+        return orig(self, scheduler_output, *args, **kwargs)
+    cls.execute_model = execute_model

@@ -4,6 +4,8 @@
 #   ink2.sh up | down | status | logs
 #   PROFILE=fast ink2.sh up: also the RTX PRO 6000 (3-bit copies of the warm experts), GPTQ NVFP4 layers 40-47 and a
 #   larger hot set, from FAST_DIR (the "fast" folder of huggingface.co/chronarion/Inkling-2-Small-ink2)
+#   ENTRY / ENTRY_ARGS (development): another entrypoint wrapping vllm, e.g. ENTRY=/nsys/bin/nsys
+#   ENTRY_ARGS="profile ... -o /prof/run vllm" with DOCKER_EXTRA mounting /opt/nvidia/nsight-systems at /nsys
 set -euo pipefail
 E=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 NAME=${NAME:-inkling2}
@@ -21,9 +23,10 @@ if [ "$PROFILE" = fast ]; then
   FAST_DIR=$(cd "$FAST_DIR" && pwd)
   DOCKER_EXTRA="${DOCKER_EXTRA:-} -v $FAST_DIR:$FAST_DIR:ro"
   export INK2_BAND=${INK2_BAND:-$FAST_DIR/band} INK2_EXPERT_OVERRIDE=${INK2_EXPERT_OVERRIDE:-$FAST_DIR/gptq40}
-  # DSpark (the draft model in the checkpoint) is on: 2 drafts at 1 request, 1 at 2-4, none at 5 or more; its placement
-  # leaves GPU memory for the drafter. SPEC= (empty) turns it off; while it is on, vLLM refuses min_p and logit_bias.
-  SPEC=${SPEC-'{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic","num_speculative_tokens_per_batch_size":[[1,1,2],[2,4,1],[5,32,0]]}'}
+  # DSpark (the draft model in the checkpoint) is on: 3 drafts at 1 request, 1 at 2-16, none above (quick lil cells, 11-14:
+  # 197 / 723 / 995 vs 181 / 619 / 945 with 2 / 1 (2-4) / 0); its placement leaves GPU memory for the drafter.
+  # SPEC= (empty) turns it off; while it is on, vLLM refuses min_p and logit_bias.
+  SPEC=${SPEC-'{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic","num_speculative_tokens_per_batch_size":[[1,1,3],[2,16,1],[17,32,0]]}'}
   if [ -n "$SPEC" ]; then FAST_PLACEMENT=placement-dspark.json; else FAST_PLACEMENT=placement.json; fi
   export INK2_PLACEMENT=${INK2_PLACEMENT:-$FAST_DIR/$FAST_PLACEMENT}
 elif [ "$PROFILE" != standard ]; then
@@ -60,7 +63,7 @@ up() {
     -v $STATE/vllm:/root/.cache/vllm -v $STATE/triton:/root/.triton -v $STATE/flashinfer:/root/.cache/flashinfer \
     $(env | grep -o "^INK2_[A-Z0-9_]*" | sed "s/^/-e /" | tr "\n" " ") \
     -e HF_HUB_OFFLINE=1 -e VLLM_LOGGING_LEVEL=INFO \
-    --entrypoint vllm $IMG serve $MODEL --served-model-name inkling-2-small Inkling-2-Small inkling2 \
+    --entrypoint ${ENTRY:-vllm} $IMG ${ENTRY_ARGS:-} serve $MODEL --served-model-name inkling-2-small Inkling-2-Small inkling2 \
     --tensor-parallel-size 1 --max-model-len $MAXLEN --max-num-seqs ${MAXSEQS:-32} --max-num-batched-tokens ${MAXBT:-4096} \
     --gpu-memory-utilization ${GPU_MEM_UTIL:-0.94} \
     --reasoning-parser inkling --tool-call-parser inkling --enable-auto-tool-choice \

@@ -1,6 +1,6 @@
 # ink2: Inkling 2 Small on a DGX Station GB300
 
-> **Early release, likely buggy.** This is the second public version. It has been tested (see
+> **Early release, likely buggy.** This is the third public version. It has been tested (see
 > [Output quality](#output-quality)), but not under real traffic for long, and it runs a few patches on top of a
 > vLLM preview image. Please report problems as issues.
 
@@ -11,9 +11,9 @@ spread over the rest of the machine. There are two ways to run it:
 
 - **fast** (recommended): the next most used experts run on the station's second GPU, the RTX PRO 6000, as 3-bit
   copies; the experts of layers 40-47 are recalibrated to 4 bits so more of them fit in GPU memory; the least used
-  stay in the Grace CPU's memory, where the GPU reads them in place. It generates about 180 tokens per second for
-  one request, about 605 in total for 8 requests and about 925 for 16, and reads prompts at about
-  7,800 tokens per second. Its next-token probabilities stay close to the 8-bit release of the model (see
+  stay in the Grace CPU's memory, where the GPU reads them in place. It generates about 185 tokens per second for
+  one request, about 715 in total for 8 requests and about 940 for 16, and reads prompts at about
+  7,900 tokens per second. Its next-token probabilities stay close to the 8-bit release of the model (see
   [Output quality](#output-quality)). It needs both GPUs and 140 GB of extra weights from Hugging Face.
 - **standard**: the official NVFP4 weights, unchanged, on the GB300 alone (the first release): about 120 tokens per
   second for one request, 365-390 for 8 and 490 for 16.
@@ -52,14 +52,14 @@ standard/1), generated tokens per second (8 and 16 requests: all requests togeth
 
 | context | profile | 1 request | 8 requests | 16 requests |
 |---|---|---:|---:|---:|
-| empty | fast | 183.4 | 605.5 | 924.6 |
+| empty | fast | 186.4 | 716.9 | 941.3 |
 | | standard | 122.5 | 386.2 | 489.1 |
-| 64K tokens | fast | 163.0 | 523.8 | 791.2 |
+| 64K tokens | fast | 161.9 | 631.5 | 829.0 |
 | | standard | 122.0 | 392.9 | 489.9 |
-| 128K tokens | fast | 155.4 | 464.3 | (skipped, see below) |
+| 128K tokens | fast | 160.5 | 564.1 | (skipped, see below) |
 | | standard | 119.5 | 364.6 | (skipped) |
 
-Prompt reading: 7,924 tokens per second for a 32K-token prompt (first token after 4.1 s) and 7,750 for 128K (16.6 s)
+Prompt reading: 7,940 tokens per second for a 32K-token prompt (first token after 4.1 s) and 7,773 for 128K (16.6 s)
 with the fast profile; 6,708 and 6,680 (4.8 s and 19.3 s) with the standard profile.
 
 Unrelated conversations (`bench/mixed_bench.py`: 52 different prompts of wiki summaries, chat, maths, Chinese and
@@ -67,7 +67,7 @@ code, 1,024 tokens each, temperature 1), generated tokens per second:
 
 | profile | 1 conversation | 8 conversations | 16 conversations |
 |---|---:|---:|---:|
-| fast | 195.5 | 522.1 | 793.7 |
+| fast | 218.2 | 651.8 | 883.9 |
 | standard | 115.4 | 236.9 | 269.9 |
 
 <details><summary>How it was measured</summary>
@@ -75,7 +75,7 @@ code, 1,024 tokens each, temperature 1), generated tokens per second:
 lil-bench ran inside the server container with `python3 -m lil_bench --no-upload --no-p2pmark --url
 http://127.0.0.1:8111` (`bench/lil_full.sh`); the fast profile on 2026-11-14, the standard profile on 2026-11-13. The
 16-request cell at 128K is skipped by the benchmark itself: it needs 2.13M tokens of KV cache and the server has
-1,113,072 (fast) or 1,147,326 (standard). The mixed numbers are from one boot per profile, 90 s per cell after 20 s of
+1,111,269 (fast) or 1,147,326 (standard). The mixed numbers are from one boot per profile, 90 s per cell after 20 s of
 warm-up. Boots differ by 2-4%.
 
 </details>
@@ -87,8 +87,9 @@ warm-up. Boots differ by 2-4%.
   most used, about 125-140 per layer, run on the RTX PRO 6000 as 3-bit copies. The rest stay in pinned Grace memory and the
   GB300 reads them in place over NVLink-C2C. For every decode step, the rows routed to the RTX's experts go to it
   through pinned host memory; the RTX computes them while the GB300 computes its own experts and the Grace-resident
-  ones; one combine adds the three. Prompts (long calls) do not use the RTX: they read the Grace-resident copies of
-  those experts instead.
+  ones; one combine adds the three. One kernel routes each token once for all three places (the router, its top 8
+  experts, the GPU parts' layouts and the RTX's hand-off). Prompts (long calls) do not use the RTX: they read the
+  Grace-resident copies of those experts instead.
 - **The 3-bit copies.** They follow brandonmusic's TR3v4 recipe for 3-bit trellis quantization (the EXL3 format of
   ExLlamaV3, based on QTIP): randomized Hadamard rotations, per-expert channel orderings and scales, error-feedback
   rounding against each expert's own captured inputs, with the down projection calibrated on the quantized gate and
@@ -100,9 +101,10 @@ warm-up. Boots differ by 2-4%.
   to come in view. That halves their size and frees 18.7 GiB of GPU memory, which holds more experts and, by default,
   the draft model below.
 - **Drafting (fast profile).** The checkpoint ships a small draft model (DSpark) that proposes the next tokens; the
-  full model checks them all in one step. Here it proposes 2 tokens for one request, 1 for 2-4 requests and none
-  from 5. The RTX computes the extra rows of a checking step at almost no extra cost, so drafting pays much more than
-  in the first release (+41% for one request, against +12%).
+  full model checks them all in one step. Here it proposes 3 tokens for one request, 1 for 2-16 requests and none
+  from 17. The RTX computes the extra rows of a checking step at almost no extra cost, so drafting pays much more than
+  in the first release: about +60% for one request and +17% for eight (in the first release +12% for one request and
+  a loss for eight).
 - **The expert set follows the text.** While serving, routing counts are kept for every expert (inside the combine
   kernel, at no extra cost). Every 8 steps an expert that the current text uses a lot can replace a little-used one in
   GPU memory, but only if it is likely to pay back the copy, judged with error margins on two time scales and with the
@@ -140,14 +142,14 @@ Checks run on this release (fast profile):
 - OpenAI API options 20/25 (sampling settings, stop strings, logprobs, n, JSON schema, penalties): the five that fail
   set `min_p` or `logit_bias`, which vLLM refuses while speculative decoding (DSpark) is on;
 - tool calls 2/2, with thinking on and off;
-- answers independent of request order: with one stream every prompt got the same answer in every order, but 3 of
-  the 24 prompts got a different answer than the check expects (85/96); with four streams 177/192 (the standard
-  profile: 96/96 and 191/192): see [Limitations](#limitations);
+- answers independent of request order: 92/96 with one stream (every prompt got the same answer in every order; one
+  of the 24 always gets an answer the check does not accept) and 175/192 with four (the standard profile: 96/96 and
+  191/192): see [Limitations](#limitations);
 - 16 prompts of 30K tokens at once, all 16 answered correctly;
 - GSM8K 195/200 at temperature 1 with 8 requests at once;
-- a needle found in a 129K-token prompt, and in 513K-token prompts at three depths (`bench/needle.py --seed 7
-  --max-tokens 256`: at that length the model, with the official weights too, often first says a sentence about the
-  question before the passphrase).
+- a needle found at three depths of 129K- and 513K-token prompts (`bench/needle.py --seed 7 --max-tokens 256`: at
+  513K the model, with the official weights too, often first says a sentence about the question before the
+  passphrase).
 
 The standard profile passed the same checks in the first release. Moving experts between GPU and Grace memory is
 exact: prompt log-probabilities are identical bit for bit with the expert set fixed, following the text, or swapped at
@@ -162,12 +164,11 @@ mean log-likelihood.
 - In the fast profile a request gives the same answer every time it runs alone, but the numbers can change slightly
   with what else runs at the same time: the RTX's kernel divides each expert's work according to the size of the whole
   batch. A greedy answer at a near-tie can then change (the request-order check with four streams: 177/192, the
-  standard profile 191/192). The 3-bit copies also shift a few near-ties for good: three of the check's 24 short
-  prompts always get an answer the check does not accept ("the first 20 even numbers" starts at 0, the same question
-  after a long preamble comes back with an empty answer, and a countdown from 30 lacks the expected ending).
-- The fast profile drafts tokens with DSpark: about 180 instead of 123 tokens per second for one request, about 1%
-  less for 8 requests and 5% less for 16. While it is on, vLLM refuses requests that set `min_p` or `logit_bias`;
-  `SPEC= PROFILE=fast ./ink2.sh up` turns it off and keeps about 580 more experts in GPU memory instead.
+  standard profile 191/192). The 3-bit copies also shift a few near-ties for good: one of the check's 24 short
+  prompts (a countdown from 30 after a short preamble) always gets an answer the check does not accept.
+- The fast profile drafts tokens with DSpark (see How it works). While it is on, vLLM refuses requests that set
+  `min_p` or `logit_bias`; `SPEC= PROFILE=fast ./ink2.sh up` turns it off and keeps about 580 more experts in GPU
+  memory instead (about 123 / 616 / 976 tokens per second for 1 / 8 / 16 requests then).
 - Computing the least used experts on the Grace cores (as 4-bit copies) is built but off: on this machine it was
   slower than letting the GB300 read them in place (7% at 8 requests, 16% at 16), because the cores take longer per
   expert than the GPU's read over NVLink-C2C. It stays in the code as an experiment (`INK2_GRACE`).
@@ -230,7 +231,7 @@ checks and benchmarks. The fast profile's weights and placement are on Hugging F
 | `MAXSEQS` | 32 | maximum requests decoded together |
 | `MAXBT` | 4096 | prompt tokens per step (more needs more KV room) |
 | `GPU_MEM_UTIL` | 0.94 | share of GPU memory vLLM may use |
-| `SPEC` | fast: DSpark (2 / 1 / 0 drafts for 1 / 2-4 / 5+ requests); standard: off | vLLM `--speculative-config` JSON; empty turns drafting off |
+| `SPEC` | fast: DSpark (3 / 1 / 0 drafts for 1 / 2-16 / 17+ requests); standard: off | vLLM `--speculative-config` JSON; empty turns drafting off |
 | `EXTRA_ARGS` | | more `vllm serve` arguments |
 | `INK2_PLACEMENT` | `placement/gen-count167-s64.json` (fast: `placement.json` in `FAST_DIR`) | which experts stay in GPU memory and on the RTX (JSON: per layer the experts most used first, how many stay in GPU memory and, for the fast profile, how many go to the RTX) |
 | `INK2_BAND` | (fast: `band/` in `FAST_DIR`) | the RTX's 3-bit expert files |
@@ -243,7 +244,9 @@ checks and benchmarks. The fast profile's weights and placement are on Hugging F
 | `INK2_FA4` | all | prompt attention kernel: `all` (fast kernel everywhere), `window` (sliding-window layers only), `none` (vLLM's choice) |
 | `INK2_COUNT` | (off) | path: write routing counts of generated tokens there every 30 s (to build a placement) |
 | `INK2_GRACE`, `INK2_GRACE_INT4`, `INK2_GRACE_MIN_T`, `INK2_GRACE_THREADS`, `INK2_GRACE_CORE0`, `INK2_GRACE_TIMEOUT_MS` | (off) | experimental: the least used experts computed on the Grace cores (see `ink2/graceband.py`) |
+| `INK2_ROUTE3` | 1 | the one routing kernel for calls of up to 16 tokens (0: a route per place, as before) |
 | `INK2_DEBUG` | 0 | 1: checks after every MoE stage outside CUDA graphs (names the stage of a GPU fault) |
+| `INK2_PROF_STEPS` | (off) | `start:stop`: cudaProfilerStart / Stop around those decode steps (development) |
 
 </details>
 
@@ -255,6 +258,7 @@ checks and benchmarks. The fast profile's weights and placement are on Hugging F
 | `sitecustomize.py` | installs the patches when vLLM imports its Inkling 2 model |
 | `ink2/split.py` | the MoE layer: experts split between GPU memory, the RTX and Grace memory, the second stream, routing counts |
 | `ink2/band.py` | the RTX's part: its experts, the pinned hand-off slot, the send and stage kernels |
+| `ink2/route3.py` | one routing kernel for a decode call: the GPU parts' layouts and the RTX's hand-off from one top 8 |
 | `ink2/combine2.py` | one combine kernel over all parts (and the counts) |
 | `ink2/follow.py` | the expert set that follows the text: rates, the swap rule, the ledger |
 | `ink2/attn.py` | the prompt-attention kernel choice |
@@ -268,6 +272,8 @@ checks and benchmarks. The fast profile's weights and placement are on Hugging F
 | `placement/counts-gen.json` | routing counts of 267K generated tokens (a general corpus) |
 | `bench/qa.py`, `api_check.py`, `tools_check.py`, `order_check.py`, `burst_check.py`, `gsm8k_acc.py`, `needle.py`, `longcheck.py`, `logprob_check.py` | correctness checks |
 | `bench/mixed_bench.py`, `quick.sh`, `lil_full.sh`, `route_corpus.py` | benchmarks and the routing-count corpus driver |
+| `bench/greedy_compare.py` | greedy decode of fixed prompts with logprobs, to compare two builds token for token |
+| `tools/trace_summary.py` | kernel time per device and stream from a vLLM torch-profiler trace |
 
 `bench/*` scripts that read text take a corpus JSON (`INK2_CORPUS`: `{"wikitext_test": [...], "no_robots_test":
 [...], "gsm8k_test": [{"q", "a"}], "zhwiki": [{"text"}]}` built from WikiText-2, HuggingFaceH4/no_robots, GSM8K and

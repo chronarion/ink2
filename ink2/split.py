@@ -84,6 +84,9 @@ _BAND_MIN_T = int(os.environ.get("INK2_BAND_MIN_T", "1"))
 # it): every distinct count compiles again for every graph size. The route state and the plan use the count rounded
 # up to a block of 64; the expert bounds stay exact, so the extra experts never get rows.
 _PAD = int(os.environ.get("INK2_PAD", "64"))
+# INK2_ROUTE3 (default 1; 0: the three routes): band calls of up to 16 tokens route once (ink2/route3.py: the hot and tail layouts and the band slot
+# from one router GEMV and top-k) instead of three route launches and the band's send
+_ROUTE3 = os.environ.get("INK2_ROUTE3", "1") == "1"
 
 
 def _pad(n):
@@ -215,10 +218,18 @@ class _Part(nn.Module):
         return bmm(act, act_scale, row_scale, getattr(self, f"{name}_weight"), getattr(self, f"{name}_weight_scale"),
                    self.ones, tiles, plan, projection)
 
-    def forward(self, x, gate, is_padding):
+    def route_part(self, x, gate, is_padding):
+        """this part's routing and quantized rows of x (the first half of forward)"""
         plan = self.plan(x.shape[0])
         routing, quantized = route(x, gate.weight, gate.bias, self.counters, self.counts, gate.topk, gate.route_scale,
                                    self.expert_bounds, plan, *self.scales("w13"), is_padding)
+        return routing, quantized, plan
+
+    def forward(self, x, gate, is_padding):
+        return self.compute(*self.route_part(x, gate, is_padding))
+
+    def compute(self, routing, quantized, plan):
+        """the experts' GEMMs over route_part's layout (the second half of forward)"""
         src2dst, gammas, rows, tiles = routing
         gate_up = self._gemm(quantized, "w13", tiles, plan, 0)
         m = plan.max_ctas
@@ -425,6 +436,25 @@ class SplitMoE(nn.Module):
         _dbg.sync(f"before layer {ex.layer_id} T={T}")
         _dbg.note(ex.layer_id, T, _gb.ENABLE and T >= _gb.MIN_T, x)
         main, side = torch.cuda.current_stream(), _side_stream()
+        if _ROUTE3 and not _gb.ENABLE:
+            from ink2 import route3 as _r3
+            if T <= _r3.MAX_TOKENS:
+                (ra, qa, pa), (rc, qc, pc) = _r3.route3(x, self.gate, ex.hot, ex.tail, b, is_padding)
+                b.ev_go.record(main)                                # the band slot is written
+                _dbg.sync(f"route3, layer {ex.layer_id} T={T}")
+                b.run(T)
+                side.wait_stream(main)
+                with torch.cuda.stream(side):
+                    tail = ex.tail.compute(rc, qc, pc)
+                hot = ex.hot.compute(ra, qa, pa)
+                main.wait_stream(side)
+                main.wait_event(b.ev_done)
+                _dbg.sync(f"route3 parts + band, layer {ex.layer_id} T={T}")
+                acc = self._count_acc if (self._count_acc is not None and T <= _COUNT_MAX) else None
+                (dh, sh, th), (dt, st, tt) = hot, tail
+                out = combine2(dh, sh, th, dt, st, tt, topk, x.dtype, pa.tile, ex.H + ex.W, acc, extra=b.y_g[:T])
+                _dbg.note(ex.layer_id, T, False, x, out)
+                return out
         side.wait_stream(main)
         with torch.cuda.stream(side):
             bp = expert_plan(T, topk, b.n_pad, False, ex.cold.shapes)
@@ -486,10 +516,11 @@ def install():
         finally:
             _model.Inkling2MoE = orig_moe
     _model.Inkling2DecoderLayer.__init__ = __init__
-    from ink2 import attn, follow, graceband
+    from ink2 import attn, debug, follow, graceband
     attn.install()
     follow.install_runner_hook()
     graceband.install_runner_check()
+    debug.install_profiler_steps()
     # INK2_HOOKS=mod1,mod2: extra measurement modules (each with install()), found in INK2_HOOK_PATH (logit dumps,
     # calibration captures)
     hooks = [h for h in os.environ.get("INK2_HOOKS", "").split(",") if h]
