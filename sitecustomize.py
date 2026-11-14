@@ -26,3 +26,10 @@ if os.environ.get("INK2_SPLIT", "1") == "1":
             return spec
 
     sys.meta_path.insert(0, _Finder())
+
+# INK2_GRACE: vLLM's own threads (every process) stay on cores 0 .. INK2_GRACE_CORE0 - 1; the Grace band's pool uses the rest
+if os.environ.get("INK2_GRACE") in ("native", "int4"):
+    try:
+        os.sched_setaffinity(0, set(range(int(os.environ.get("INK2_GRACE_CORE0", "16")))))
+    except OSError:
+        pass

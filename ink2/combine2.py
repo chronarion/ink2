@@ -9,9 +9,10 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
-def _combine2_kernel(DownA, SrcA, TilesA, DownB, SrcB, TilesB, Out, Acc, Extra,
+def _combine2_kernel(DownA, SrcA, TilesA, DownB, SrcB, TilesB, Out, Acc, Extra, Extra2,
                      H: tl.constexpr, TOPK: tl.constexpr, BLOCK: tl.constexpr,
-                     TILE: tl.constexpr, NA: tl.constexpr, COUNT: tl.constexpr, EXTRA: tl.constexpr):
+                     TILE: tl.constexpr, NA: tl.constexpr, COUNT: tl.constexpr, EXTRA: tl.constexpr,
+                     EXTRA2: tl.constexpr):
     tl.extra.cuda.gdc_wait()
     token = tl.program_id(0).to(tl.int64)
     block = tl.program_id(1)
@@ -34,10 +35,13 @@ def _combine2_kernel(DownA, SrcA, TilesA, DownB, SrcB, TilesB, Out, Acc, Extra,
             tl.atomic_add(Acc + NA + eb, 1, mask=first & in_b, sem="relaxed")
     if EXTRA:   # another tier's fp32 partial of this token (the RTX band), before the single rounding
         acc += tl.load(Extra + token * H + cols)
+    if EXTRA2:  # a third tier's (the Grace cores' tail)
+        acc += tl.load(Extra2 + token * H + cols)
     tl.store(Out + token * H + cols, acc)
 
 
-def combine2(down_a, src_a, tiles_a, down_b, src_b, tiles_b, topk, out_dtype, tile, n_a, acc=None, extra=None):
+def combine2(down_a, src_a, tiles_a, down_b, src_b, tiles_b, topk, out_dtype, tile, n_a, acc=None, extra=None,
+             extra2=None):
     """acc: int64 [E] counter row of this layer (positions), or None; extra: fp32 [T, H] partial to add, or None"""
     tokens = src_a.numel() // topk
     hidden = down_a.shape[1]
@@ -46,6 +50,6 @@ def combine2(down_a, src_a, tiles_a, down_b, src_b, tiles_b, topk, out_dtype, ti
     assert hidden % block == 0 and down_b.shape[1] == hidden
     assert acc is None or (acc.dtype == torch.int64 and acc.is_contiguous())
     _combine2_kernel[(tokens, hidden // block)](down_a, src_a, tiles_a, down_b, src_b, tiles_b, out, acc, extra,
-                                                hidden, topk, block, tile, n_a, acc is not None, extra is not None,
-                                                num_warps=2, launch_pdl=True)
+                                                extra2, hidden, topk, block, tile, n_a, acc is not None,
+                                                extra is not None, extra2 is not None, num_warps=2, launch_pdl=True)
     return out

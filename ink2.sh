@@ -2,6 +2,8 @@
 # ink2: Inkling 2 Small on one DGX Station GB300 (vLLM's Inkling 2 model; routed experts split between GPU memory and
 # Grace memory, ink2/split.py).
 #   ink2.sh up | down | status | logs
+#   PROFILE=fast ink2.sh up: also the RTX PRO 6000 (3-bit copies of the warm experts), GPTQ NVFP4 layers 40-47 and a
+#   larger hot set, from FAST_DIR (the "fast" folder of huggingface.co/chronarion/Inkling-2-Small-ink2)
 set -euo pipefail
 E=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 NAME=${NAME:-inkling2}
@@ -9,6 +11,35 @@ PORT=${PORT:-8111}
 IMG=${IMG:-vllm/vllm-openai:inkling-2-small-arm64}
 MODEL=${MODEL:-$(ls -d /data/hf/hub/models--thinkingmachines--Inkling-2-Small/snapshots/*/ 2>/dev/null | head -1)}
 GB=${GB:-GPU-73779fc7-ce41-b87b-5239-16e36ce490fe}
+RTX=${RTX:-GPU-84b21d5a-e28c-3068-93f1-5ca038d90ded}
+PROFILE=${PROFILE:-standard}
+if [ "$PROFILE" = fast ]; then
+  FAST_DIR=${FAST_DIR:-$(ls -d /data/hf/hub/models--chronarion--Inkling-2-Small-ink2/snapshots/*/fast 2>/dev/null | head -1)}
+  if [ ! -d "${FAST_DIR:-}/band" ] || [ ! -d "$FAST_DIR/gptq40" ] || [ ! -f "$FAST_DIR/placement.json" ]; then
+    echo "PROFILE=fast needs FAST_DIR with band/, gptq40/ and placement.json (got '${FAST_DIR:-}'; see README)"; exit 2
+  fi
+  FAST_DIR=$(cd "$FAST_DIR" && pwd)
+  DOCKER_EXTRA="${DOCKER_EXTRA:-} -v $FAST_DIR:$FAST_DIR:ro"
+  export INK2_BAND=${INK2_BAND:-$FAST_DIR/band} INK2_EXPERT_OVERRIDE=${INK2_EXPERT_OVERRIDE:-$FAST_DIR/gptq40}
+  # DSpark (the draft model in the checkpoint) is on: 2 drafts at 1 request, 1 at 2-4, none at 5 or more; its placement
+  # leaves GPU memory for the drafter. SPEC= (empty) turns it off; while it is on, vLLM refuses min_p and logit_bias.
+  SPEC=${SPEC-'{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic","num_speculative_tokens_per_batch_size":[[1,1,2],[2,4,1],[5,32,0]]}'}
+  if [ -n "$SPEC" ]; then FAST_PLACEMENT=placement-dspark.json; else FAST_PLACEMENT=placement.json; fi
+  export INK2_PLACEMENT=${INK2_PLACEMENT:-$FAST_DIR/$FAST_PLACEMENT}
+elif [ "$PROFILE" != standard ]; then
+  echo "PROFILE is standard (default) or fast"; exit 2
+fi
+# INK2_BAND (dir of TR3 band weights, ink2/band.py): the RTX joins the container as cuda:1 (GB300 first); its kernels
+# build from RTX_SRC (the moe3i sources) with the CUDA headers the image lacks (inc/, symlinks into the image)
+RTX_SRC=${RTX_SRC:-$E/rtx}
+GPUS="--device nvidia.com/gpu=$GB"
+# INK2_GRACE (ink2/graceband.py, experimental, off): the tail on the Grace cores; its host code builds from cpuband/
+if [ -n "${INK2_GRACE:-}" ]; then
+  GPUS="$GPUS -v $(cd ${CPUBAND_SRC:-$E/cpuband} && pwd):/ink2cpuband:ro"
+fi
+if [ -n "${INK2_BAND:-}" ]; then
+  GPUS="$GPUS --device nvidia.com/gpu=$RTX -e CUDA_VISIBLE_DEVICES=$GB,$RTX -v $(cd $RTX_SRC && pwd):/ink2rtx:ro -e CPATH=/ink2engine/inc"
+fi
 MAXLEN=${MAXLEN:-1048576}
 # expert placement (engine/placement/*.json, built by tools/mkplace.py from decode routing counts)
 export INK2_PLACEMENT=${INK2_PLACEMENT:-/ink2engine/placement/gen-count167-s64.json}
@@ -22,8 +53,8 @@ down() { docker rm -f $NAME >/dev/null 2>&1 || true; log down; }
 up() {
   down
   mkdir -p $STATE/vllm $STATE/triton $STATE/flashinfer
-  log "starting: port $PORT, max model length $MAXLEN, placement ${INK2_PLACEMENT:-none (INK2_HOT ${INK2_HOT:-192})}"
-  docker run -d --name $NAME --restart no --device nvidia.com/gpu=$GB --ipc host --network host \
+  log "starting: profile $PROFILE${SPEC:+ + speculative decoding}, port $PORT, max model length $MAXLEN, placement ${INK2_PLACEMENT:-none (INK2_HOT ${INK2_HOT:-192})}"
+  docker run -d --name $NAME --restart no $GPUS --ipc host --network host \
     --cap-add SYS_NICE --cap-add IPC_LOCK --ulimit memlock=-1 --ulimit stack=67108864 --security-opt label=disable \
     -v /data/hf:/data/hf:ro -v $E:/ink2engine:ro -e PYTHONPATH=/ink2engine ${DOCKER_EXTRA:-} \
     -v $STATE/vllm:/root/.cache/vllm -v $STATE/triton:/root/.triton -v $STATE/flashinfer:/root/.cache/flashinfer \

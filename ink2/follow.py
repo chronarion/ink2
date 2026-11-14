@@ -26,7 +26,9 @@ import numpy as np
 import torch
 
 _E = os.environ.get
-ENABLE = _E("INK2_FOLLOW", "1") == "1"
+# off with an int4 Grace tail (INK2_GRACE=int4): the cores hold their own int4 copy of each tail expert, which a hot <-> tail
+# swap of the native weights would not follow
+ENABLE = _E("INK2_FOLLOW", "1") == "1" and _E("INK2_GRACE", "") != "int4"
 PERIOD = int(_E("INK2_FOLLOW_PERIOD", "8"))
 SWAPS = int(_E("INK2_FOLLOW_SWAPS", "4"))
 TAU_F = float(_E("INK2_FOLLOW_TAU_F", "128"))
@@ -75,6 +77,8 @@ class Follow:
         assert layers == list(range(L))
         ex0 = [self.moes[l].experts for l in layers]
         self.H = np.array([ex.H for ex in ex0])
+        # experts in an RTX band (ink2/band.py, positions [H, H + W)) never move: candidates come from the tail only
+        self.Wb = np.array([getattr(ex, "W", 0) for ex in ex0])
         self.nbytes = np.array([sum(getattr(ex.hot, n)[0].numel() * getattr(ex.hot, n).element_size() for n in _WEIGHTS)
                                 if ex.H else 0 for ex in ex0], dtype=np.float64)
         self.cost = np.array([COST[0] if ex.nvfp4 else COST[1] for ex in ex0])
@@ -207,18 +211,19 @@ class Follow:
         now = self.step
         for i in range(L):
             H = int(self.H[i])
-            if H == 0 or H == E:
+            Hc = H + int(self.Wb[i])
+            if H == 0 or Hc >= E:
                 continue
             kv = keep[i, :H].copy()
             kv[self.rank0[i, :H] < H - PMAX] = np.inf       # protected core: the boot-top H - PMAX experts
             kv[now - self.born[i, :H] < GRACE] = np.inf
-            val = np.maximum(lf[i, H:] * TH, lm[i, H:] * TM)
-            val[now - self.gone[i, H:] < GRACE_OUT] = -1.0
-            k = min(4, H, E - H)
+            val = np.maximum(lf[i, Hc:] * TH, lm[i, Hc:] * TM)
+            val[now - self.gone[i, Hc:] < GRACE_OUT] = -1.0
+            k = min(4, H, E - Hc)
             hot = np.argpartition(kv, k - 1)[:k]; hot = hot[np.argsort(kv[hot])]
             cold = np.argpartition(-val, k - 1)[:k]; cold = cold[np.argsort(-val[cold])]
             for s, cj in zip(hot, cold):
-                c = H + int(cj)
+                c = Hc + int(cj)
                 if not np.isfinite(kv[s]) or val[cj] <= 0.0:
                     break
                 gain = max((lf[i, c] - kv[s]) * TH, (lm[i, c] - kv[s]) * TM) - self.margin * self.cost[i]

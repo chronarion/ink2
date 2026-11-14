@@ -76,6 +76,18 @@ _PARALLEL = os.environ.get("INK2_PARALLEL", "1") == "1"
 # only up to this many tokens (decode, verify): prefill chunks are bound by the sweep of every expert anyway, and a
 # side stream keeps its own allocator pool (the profile peak at 8,192 tokens grew 3.6 GiB)
 _PAR_MAX = int(os.environ.get("INK2_PAR_MAX", "512"))
+_BAND_MAX = int(os.environ.get("INK2_BAND_MAX", "64"))
+# smaller calls skip the RTX band and read the warm experts' native copies in place from Grace memory, as the two-tier
+# engine does (measured 11-14: 23% slower at one row than the band's round trip, so by default no call skips it)
+_BAND_MIN_T = int(os.environ.get("INK2_BAND_MIN_T", "1"))
+# vLLM's route kernel takes the number of local experts as a compile-time constant (and the plan's tile count follows
+# it): every distinct count compiles again for every graph size. The route state and the plan use the count rounded
+# up to a block of 64; the expert bounds stay exact, so the extra experts never get rows.
+_PAD = int(os.environ.get("INK2_PAD", "64"))
+
+
+def _pad(n):
+    return -(-n // _PAD) * _PAD if n else 0
 _SIDE = []
 
 
@@ -93,6 +105,19 @@ def _placement():
         if path:
             _LOG(f"placement {path}: {len(_PLACEMENT['layers'])} layers")
     return _PLACEMENT
+
+
+def _override_file(layer):
+    """(path, format) of this layer's expert override, or None"""
+    d = os.environ.get("INK2_EXPERT_OVERRIDE", "")
+    path = os.path.join(d, f"layer{layer}.safetensors") if d else ""
+    if not path or not os.path.exists(path):
+        return None
+    from safetensors import safe_open
+    with safe_open(path, "pt", device="cpu") as f:
+        fmt = (f.metadata() or {}).get("format", "nvfp4")
+    assert fmt in ("nvfp4", "mxfp8"), f"{path}: format {fmt}"
+    return path, fmt
 
 
 def _host_tensor(shape, dtype, device):
@@ -113,6 +138,7 @@ class _Part(nn.Module):
     def __init__(self, n, start, nvfp4, shapes, topk, gate_cap, up_cap, host):
         super().__init__()
         self.n, self.start, self.nvfp4, self.shapes, self.topk = n, start, nvfp4, shapes, topk
+        self.n_pad = _pad(n)
         self.gate_cap, self.up_cap, self.host = gate_cap, up_cap, host
         dev = torch.device("cuda", torch.cuda.current_device())
         pack, group = (2, 16) if nvfp4 else (1, 32)
@@ -134,22 +160,55 @@ class _Part(nn.Module):
                                      torch.empty(1, dtype=torch.float32, device=dev), persistent=False)
         self.register_buffer("expert_bounds", torch.tensor([start, start + n], dtype=torch.int32, device=dev),
                              persistent=False)
-        self.register_buffer("counts", torch.zeros(n, dtype=torch.int32, device=dev), persistent=False)
+        self.register_buffer("counts", torch.zeros(self.n_pad, dtype=torch.int32, device=dev), persistent=False)
         # own completion counters: the two parts' route kernels may run at the same time (INK2_PARALLEL)
         self.register_buffer("counters", torch.zeros(NUM_COUNTERS, dtype=torch.int32, device=dev), persistent=False)
-        self.register_buffer("ones", torch.ones(n, dtype=torch.float32, device=dev), persistent=False)
+        self.register_buffer("ones", torch.ones(self.n_pad, dtype=torch.float32, device=dev), persistent=False)
+
+    @classmethod
+    def view(cls, parent, off):
+        """experts [parent.start + off, parent.start + parent.n) of a parent part, sharing its buffers"""
+        v = cls.__new__(cls)
+        nn.Module.__init__(v)
+        v.n, v.start = parent.n - off, parent.start + off
+        v.n_pad = _pad(v.n)
+        v.nvfp4, v.shapes, v.topk = parent.nvfp4, parent.shapes, parent.topk
+        v.gate_cap, v.up_cap, v.host = parent.gate_cap, parent.up_cap, parent.host
+        v._host = {k: t[off:] for k, t in parent._host.items()}
+        dev = parent.expert_bounds.device
+        for name in ("w13", "w2"):
+            for suffix in ("weight", "weight_scale"):
+                v.register_buffer(f"{name}_{suffix}", getattr(parent, f"{name}_{suffix}")[off:], persistent=False)
+            if parent.nvfp4:
+                v.register_buffer(f"{name}_weight_amax", getattr(parent, f"{name}_weight_amax")[off:], persistent=False)
+                v.register_buffer(f"{name}_weight_outer_scale_denominator",
+                                  getattr(parent, f"{name}_weight_outer_scale_denominator"), persistent=False)
+        v.register_buffer("expert_bounds", torch.tensor([v.start, v.start + v.n], dtype=torch.int32, device=dev),
+                          persistent=False)
+        v.register_buffer("counts", torch.zeros(v.n_pad, dtype=torch.int32, device=dev), persistent=False)
+        v.register_buffer("counters", torch.zeros(NUM_COUNTERS, dtype=torch.int32, device=dev), persistent=False)
+        v.register_buffer("ones", torch.ones(v.n_pad, dtype=torch.float32, device=dev), persistent=False)
+        return v
 
     def warm(self):
         if self.n:
             load_kernels((self.w13_weight, self.w2_weight), (self.w13_weight_scale, self.w2_weight_scale), self.topk)
 
     def plan(self, tokens):
-        return expert_plan(tokens, self.topk, self.n, self.nvfp4, self.shapes)
+        return expert_plan(tokens, self.topk, self.n_pad, self.nvfp4, self.shapes)
 
     def scales(self, name):
         if not self.nvfp4:
             return None, None
         return getattr(self, f"{name}_weight_amax"), getattr(self, f"{name}_weight_outer_scale_denominator")
+
+    def route_only(self, x, gate, is_padding):
+        """this part's routing of x: (src2dst, gammas, tiles, plan) (the Grace band's job comes from it)"""
+        plan = self.plan(x.shape[0])
+        routing, _ = route(x, gate.weight, gate.bias, self.counters, self.counts, gate.topk, gate.route_scale,
+                           self.expert_bounds, plan, *self.scales("w13"), is_padding)
+        src2dst, gammas, _, tiles = routing
+        return src2dst, gammas, tiles, plan
 
     def _gemm(self, quantized, name, tiles, plan, projection):
         act, act_scale, row_scale = quantized
@@ -183,21 +242,47 @@ class SplitExperts(nn.Module):
         H = int(pl["hot"].get(str(layer_id), os.environ.get("INK2_HOT", "192")))
         self.layer_id, self.E, self.H = layer_id, E, H
         self.perm = torch.tensor(order, dtype=torch.long, device="cpu")   # new index -> checkpoint expert
+        # INK2_EXPERT_OVERRIDE=dir: layer{L}.safetensors replaces this layer's routed experts (checkpoint names and raw
+        # layout, all experts, metadata "format": nvfp4 | mxfp8), possibly in another format than the checkpoint's; the
+        # checkpoint's own tensors for the layer are then accepted and dropped
+        self._ovr = _override_file(layer_id)
+        ckpt_format = quant_format
+        if self._ovr is not None:
+            quant_format = self._ovr[1]
         self.nvfp4 = quant_format == "nvfp4"
+        ckpt_nvfp4 = ckpt_format == "nvfp4"
         hidden, inter = config.hidden_size, config.intermediate_size
         shapes = ((2 * inter, hidden), (hidden, inter))
         args = (self.nvfp4, shapes, config.num_experts_per_tok, config.mlp_gate_softcap, config.mlp_up_softcap)
         self.hot = _Part(H, 0, *args, host=False)
         self.cold = _Part(E - H, H, *args, host=True)
-        pack, group = (2, 16) if self.nvfp4 else (1, 32)
-        wdt = torch.uint8 if self.nvfp4 else torch.float8_e4m3fn
-        sdt = torch.float8_e4m3fn if self.nvfp4 else torch.uint8
+        from ink2 import debug as _dbg
+        _dbg.register(layer_id, "hot", self.hot)
+        _dbg.register(layer_id, "cold", self.cold)
+        # the RTX band (ink2/band.py): positions [H, H + W) also run as TR3 on the RTX for decode-sized calls; the
+        # Grace part keeps their native copies for prefill; decode reads only the tail [H + W, E) from Grace memory
+        from ink2 import band as _band
+        W = int(pl.get("warm", {}).get(str(layer_id), 0)) if _band.ENABLE else 0
+        self.W, self.band, self.tail = W, None, None
+        if W:
+            assert 0 < W < E - H, f"layer {layer_id}: warm band {W} does not fit beside {H} hot experts"
+            self.tail = _Part.view(self.cold, W)
+            self.band = _band.LayerBand(layer_id, H, W, self.perm, config.num_experts_per_tok,
+                                        torch.device("cuda", torch.cuda.current_device()))
+            from ink2 import graceband as _gb
+            _gb.register(layer_id, self)
+            _dbg.register(layer_id, "tail", self.tail)
+            _dbg.register(layer_id, "band", self.band)
+        wdt = torch.uint8 if ckpt_nvfp4 else torch.float8_e4m3fn          # placeholders: the checkpoint's names
+        sdt = torch.float8_e4m3fn if ckpt_nvfp4 else torch.uint8
         for name in ("w13", "w2"):
             self._placeholder(f"{name}_weight", wdt, self._load_weight)
             self._placeholder(f"{name}_weight_scale", sdt, self._load_scale)
-            if self.nvfp4:
+            if ckpt_nvfp4:
                 self._placeholder(f"{name}_weight_amax", torch.float32, self._load_amax)
                 self._placeholder(f"{name}_weight_outer_scale_denominator", torch.float32, self._load_denom)
+        if self._ovr is not None:
+            self._load_override()
 
     def _placeholder(self, name, dtype, loader):
         p = nn.Parameter(torch.empty(0, dtype=dtype, device="cpu"), requires_grad=False)
@@ -220,16 +305,40 @@ class SplitExperts(nn.Module):
                 else:
                     dst[c0 - lo:c1 - lo].copy_(out)
 
+    def _load_override(self):
+        from safetensors import safe_open
+        path, fmt = self._ovr
+        pre = f"model.llm.layers.{self.layer_id}.mlp.experts."
+        with safe_open(path, "pt", device="cpu") as f:
+            for name in ("w13", "w2"):
+                self._split(f"{name}_weight", f.get_tensor(pre + f"{name}_weight"), shuffle_rows)
+                self._split(f"{name}_weight_scale", f.get_tensor(pre + f"{name}_weight_scale"),
+                            lambda t: swizzle_block_scales(shuffle_rows(t)))
+                if fmt == "nvfp4":
+                    self._split(f"{name}_weight_amax", f.get_tensor(pre + f"{name}_weight_amax"), None)
+                    d = f.get_tensor(pre + f"{name}_weight_outer_scale_denominator").reshape(1)
+                    for part in (self.hot, self.cold):
+                        getattr(part, f"{name}_weight_outer_scale_denominator").copy_(d)
+        _LOG(f"layer {self.layer_id}: experts from {path} ({fmt})")
+
     def _load_weight(self, param, loaded):
+        if self._ovr is not None:
+            return
         self._split(param._ink2_name, loaded, shuffle_rows)
 
     def _load_scale(self, param, loaded):
+        if self._ovr is not None:
+            return
         self._split(param._ink2_name, loaded, lambda t: swizzle_block_scales(shuffle_rows(t)))
 
     def _load_amax(self, param, loaded):
+        if self._ovr is not None:
+            return
         self._split(param._ink2_name, loaded, None)
 
     def _load_denom(self, param, loaded):
+        if self._ovr is not None:
+            return
         for part in (self.hot, self.cold):
             getattr(part, param._ink2_name).copy_(loaded.reshape(1))
 
@@ -267,6 +376,8 @@ class SplitMoE(nn.Module):
         if not self._warmed:
             self.experts.hot.warm()
             self.experts.cold.warm()
+            if self.experts.tail is not None:
+                self.experts.tail.warm()
             self._warmed = True
         import vllm.envs as envs
         from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -279,7 +390,11 @@ class SplitMoE(nn.Module):
         if not ex.cold.n or not ex.hot.n:
             down, src2dst, _ = (ex.hot if ex.hot.n else ex.cold)(x, self.gate, is_padding)
             out = combine(down, src2dst, topk, x.dtype)
+        elif ex.band is not None and _BAND_MIN_T <= x.shape[0] <= _BAND_MAX:
+            out = self._forward_band(x, is_padding, topk)
         else:
+            from ink2 import debug as _dbg
+            _dbg.sync(f"before layer {ex.layer_id} T={x.shape[0]} (two-tier)")
             if _PARALLEL and x.shape[0] <= _PAR_MAX:
                 main, side = torch.cuda.current_stream(), _side_stream()
                 side.wait_stream(main)
@@ -294,9 +409,67 @@ class SplitMoE(nn.Module):
             # once, so the output does not depend on which part holds an expert (placement changes, INK2_FOLLOW)
             acc = self._count_acc if (self._count_acc is not None and x.shape[0] <= _COUNT_MAX) else None
             (dh, sh, th), (dc, sc, tc) = hot, cold
+            _dbg.sync(f"hot + cold parts, layer {ex.layer_id} T={x.shape[0]} (two-tier)")
             out = combine2(dh, sh, th, dc, sc, tc, topk, x.dtype, ex.hot.plan(x.shape[0]).tile, ex.H, acc)
+            _dbg.sync(f"combine, layer {ex.layer_id} T={x.shape[0]} (two-tier)")
             if acc is not None and _COUNT:
                 _count_start(x.device)
+        return out
+
+    def _forward_band(self, x, is_padding, topk):
+        """decode-sized call with the RTX band: band rows out first (side stream), the RTX computes them while the
+        GB300 runs the hot part (main) and the Grace tail (side); one combine adds all three"""
+        ex, b, T = self.experts, self.experts.band, x.shape[0]
+        from ink2 import graceband as _gb
+        from ink2 import debug as _dbg
+        _dbg.sync(f"before layer {ex.layer_id} T={T}")
+        _dbg.note(ex.layer_id, T, _gb.ENABLE and T >= _gb.MIN_T, x)
+        main, side = torch.cuda.current_stream(), _side_stream()
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            bp = expert_plan(T, topk, b.n_pad, False, ex.cold.shapes)
+            if _dbg.ENABLE:
+                _dbg.probe_band(b, ex.layer_id, T)
+            (src, gam, _, tiles), _ = route(x, self.gate.weight, self.gate.bias, b.counters, b.counts, topk,
+                                            self.gate.route_scale, b.bounds, bp, None, None, is_padding)
+            if _dbg.ENABLE:
+                _dbg.sync(f"band route only, layer {ex.layer_id} T={T}")
+                _dbg.check_route(ex.layer_id, T, src, gam, tiles, bp, b.W)
+            b.send(x, src, gam, tiles, bp.tile)
+            b.ev_go.record(side)
+        _dbg.sync(f"band route + send, layer {ex.layer_id} T={T}")
+        b.run(T)
+        _dbg.sync(f"band run (RTX), layer {ex.layer_id} T={T}")
+        grace = _gb.ENABLE and T >= _gb.MIN_T
+        with torch.cuda.stream(side):
+            if grace:      # the tail's job to the Grace cores; the GB300 skips the tail GEMMs
+                gt = _gb.tail()
+                src_t, gam_t, tiles_t, plan_t = ex.tail.route_only(x, self.gate, is_padding)
+                _dbg.sync(f"tail route_only, layer {ex.layer_id} T={T}")
+                gt.send_post(ex.layer_id, x, src_t, gam_t, tiles_t, plan_t.tile, 0)
+                _dbg.sync(f"grace send_post, layer {ex.layer_id} T={T}")
+            else:
+                tail = ex.tail(x, self.gate, is_padding)
+                _dbg.sync(f"GPU tail, layer {ex.layer_id} T={T}")
+        hot = ex.hot(x, self.gate, is_padding)
+        _dbg.sync(f"hot part, layer {ex.layer_id} T={T}")
+        main.wait_stream(side)
+        main.wait_event(b.ev_done)
+        acc = self._count_acc if (self._count_acc is not None and T <= _COUNT_MAX) else None
+        dh, sh, th = hot
+        if grace:
+            gt.wait()
+            _dbg.sync(f"grace wait, layer {ex.layer_id} T={T}")
+            none = torch.full_like(sh, -1)              # no layout rows in a second GPU part
+            out = combine2(dh, sh, th, dh, none, th, topk, x.dtype, ex.hot.plan(T).tile, ex.H + ex.W, acc,
+                           extra=b.y_g[:T], extra2=gt.partial(T))
+            _dbg.sync(f"combine with the grace partial, layer {ex.layer_id} T={T}")
+            _dbg.note(ex.layer_id, T, True, x, out, gt.partial(T))
+            return out
+        dt, st, tt = tail
+        out = combine2(dh, sh, th, dt, st, tt, topk, x.dtype, ex.hot.plan(T).tile, ex.H + ex.W, acc,
+                       extra=b.y_g[:T])
+        _dbg.note(ex.layer_id, T, False, x, out)
         return out
 
 
@@ -313,9 +486,10 @@ def install():
         finally:
             _model.Inkling2MoE = orig_moe
     _model.Inkling2DecoderLayer.__init__ = __init__
-    from ink2 import attn, follow
+    from ink2 import attn, follow, graceband
     attn.install()
     follow.install_runner_hook()
+    graceband.install_runner_check()
     # INK2_HOOKS=mod1,mod2: extra measurement modules (each with install()), found in INK2_HOOK_PATH (logit dumps,
     # calibration captures)
     hooks = [h for h in os.environ.get("INK2_HOOKS", "").split(",") if h]

@@ -1,7 +1,7 @@
 """Long-context needle test through the OpenAI-compatible API: a passphrase sentence inserted at a given depth into
 filler text built from the corpus's raw wiki/code texts, sized to N tokens with /tokenize, then the model is asked
 for the passphrase (thinking off, greedy). Reports TTFT (= prefill time) and whether the answer contains it.
-   python3 -I needle.py [URL] --tokens 131072,524288,1000000 --depths 0.1,0.5,0.9"""
+   python3 -I needle.py [URL] --tokens 131072,524288,1000000 --depths 0.1,0.5,0.9 [--max-tokens 32] [--seed S]"""
 import argparse, json, random, time, urllib.request
 import os
 
@@ -10,7 +10,10 @@ ap.add_argument("url", nargs="?", default="http://127.0.0.1:8111/v1")
 ap.add_argument("--tokens", default="131072,524288")
 ap.add_argument("--depths", default="0.5")
 ap.add_argument("--raw", default=os.environ.get("INK2_CORPUS", "/data/scratch/kld/corpus/raw.json"))
+ap.add_argument("--max-tokens", type=int, default=32)
+ap.add_argument("--seed", type=int, default=None, help="fixed passphrases (compare servers on the same needles)")
 a = ap.parse_args()
+random.seed(a.seed)
 base = a.url.rsplit("/v1", 1)[0]
 model = json.load(urllib.request.urlopen(f"{a.url}/models"))["data"][0]["id"]
 
@@ -41,8 +44,8 @@ for N in [int(x) for x in a.tokens.split(",")]:
         n = ntok(doc + q)
         t0 = time.time()
         r = post(f"{a.url}/chat/completions", dict(model=model, messages=[{"role": "user", "content": doc + q}],
-                                                   max_tokens=32, temperature=0, reasoning_effort="none"))
+                                                   max_tokens=a.max_tokens, temperature=0, reasoning_effort="none"))
         dt = time.time() - t0
         ans = r["choices"][0]["message"].get("content") or ""
         print(f"needle N={n} depth={depth}: {'PASS' if code in ans else 'FAIL'} in {dt:.1f} s "
-              f"({n / dt:.0f} tok/s end to end) answer {ans[:60]!r}", flush=True)
+              f"({n / dt:.0f} tok/s end to end) answer {ans[:160]!r}", flush=True)
